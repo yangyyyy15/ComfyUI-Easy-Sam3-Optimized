@@ -182,25 +182,125 @@ class LoadSam3Model(io.ComfyNode):
             ]
         )
 
+    # @classmethod
+    # def execute(cls, model, segmentor, device, precision, use_sage_attention=False) -> io.NodeOutput:
+    #     # 处理 Sage Attention 动态替换
+    #     if use_sage_attention:
+    #         try:
+    #             from sageattention import sageattn
+    #             import torch.nn.functional as F
+    #             # 动态替换 PyTorch 底层的 SDPA 为 SageAttention
+    #             F.scaled_dot_product_attention = sageattn
+    #             logger.info("✅ 成功启用 SageAttention 加速!")
+    #         except ImportError:
+    #             logger.warning("❌ 未找到 sageattention 库，请在终端运行 pip install sageattention。将使用默认 Attention。")
+    #     else:
+    #         # 恢复默认 Attention，避免前置节点开启后污染全局
+    #         import torch.nn.functional as F
+    #         from torch._C import _nn
+    #         if hasattr(_nn, "scaled_dot_product_attention"):
+    #             F.scaled_dot_product_attention = getattr(_nn, "scaled_dot_product_attention")
+    #             logger.info("ℹ️ 已恢复默认 PyTorch SDPA (未启用 SageAttention)")
+
+    #     # Get model path
+    #     model_path = folder_paths.get_full_path_or_raise("sam3", model)
+    #     if model_path is None:
+    #         raise ValueError(f"Model file '{model}' not found in sam3 folder")
+
+    #     if "fp16" in model.lower():
+    #         precision = "fp16"
+
+    #     # Build model based on segmentor type
+    #     if segmentor == "image":
+    #         from .sam3.model.sam3_image_processor import Sam3Processor
+    #         model_obj = build_sam3_image_model(
+    #             device=device,
+    #             eval_mode=True,
+    #             checkpoint_path=model_path,
+    #             load_from_HF=False,
+    #             enable_segmentation=True,
+    #             enable_inst_interactivity=False,
+    #             compile=False
+    #         )
+    #         processor = Sam3Processor(
+    #             model=model_obj,
+    #             resolution=1008,
+    #             confidence_threshold=0.3
+    #         )
+    #     elif segmentor == "video":
+    #         model_obj = build_sam3_video_predictor(
+    #             checkpoint_path=model_path,
+    #             gpus_to_use=None
+    #         )
+    #         processor = None
+    #     else:
+    #         raise ValueError(f"Unknown segmentor type: {segmentor}")
+
+    #     logger.info("Sam3 Model loaded successfully")
+
+    #     if precision != 'fp32' and device == 'cpu':
+    #         raise ValueError("fp16 and bf16 are not supported on cpu")
+
+    #     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
+    #     device_obj = {"cuda": torch.device("cuda"), "cpu": torch.device("cpu"), "mps": torch.device("mps")}[device]
+
+    #     sam3_model = {
+    #         "model": model_obj,
+    #         "processor": processor,
+    #         "segmentor": segmentor,
+    #         "device": device_obj,
+    #         "dtype": dtype,
+    #     }
+
+    #     return io.NodeOutput(sam3_model)
+
+
     @classmethod
     def execute(cls, model, segmentor, device, precision, use_sage_attention=False) -> io.NodeOutput:
-        # 处理 Sage Attention 动态替换
+        
+        # 防止 SageAttention 在 fp32 下报错，自动转半精度
+        if use_sage_attention and precision == "fp32":
+            logger.warning("⚠️ SageAttention 仅支持半精度，已自动将 precision 切换为 fp16")
+            precision = "fp16"
+
+        # 处理 Sage Attention 动态替换 (加入安全回调机制)
+        import torch.nn.functional as F
+        from torch._C import _nn
+        
         if use_sage_attention:
             try:
                 from sageattention import sageattn
-                import torch.nn.functional as F
-                # 动态替换 PyTorch 底层的 SDPA 为 SageAttention
-                F.scaled_dot_product_attention = sageattn
-                logger.info("✅ 成功启用 SageAttention 加速!")
+                
+                # 获取原生的 PyTorch SDPA 备份（如果还没备份的话）
+                if not hasattr(F, "_original_sdpa"):
+                    F._original_sdpa = getattr(_nn, "scaled_dot_product_attention", F.scaled_dot_product_attention)
+                
+                # 定义一个兼容 PyTorch 传参的安全包装器
+                def safe_sageattn(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, **kwargs):
+                    # 如果有 mask 或者 dropout（文本编码器会用到），则退回 PyTorch 原生 SDPA
+                    if attn_mask is not None or dropout_p > 0.0:
+                        return F._original_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+                    
+                    # 图像视觉主干网络（无 mask）走 SageAttention 加速
+                    try:
+                        return sageattn(query, key, value, is_causal=is_causal)
+                    except Exception as e:
+                        # 极端底线防御：如果某层维度 SageAttention 碰巧不支持，回退原生
+                        return F._original_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+
+                # 将全局 SDPA 替换为我们的智能安全包装器
+                F.scaled_dot_product_attention = safe_sageattn
+                logger.info("✅ 成功启用 SageAttention (附带智能安全回退机制)!")
+                
             except ImportError:
                 logger.warning("❌ 未找到 sageattention 库，请在终端运行 pip install sageattention。将使用默认 Attention。")
         else:
-            # 恢复默认 Attention，避免前置节点开启后污染全局
-            import torch.nn.functional as F
-            from torch._C import _nn
-            if hasattr(_nn, "scaled_dot_product_attention"):
+            # 恢复默认 Attention
+            if hasattr(F, "_original_sdpa"):
+                F.scaled_dot_product_attention = F._original_sdpa
+            elif hasattr(_nn, "scaled_dot_product_attention"):
                 F.scaled_dot_product_attention = getattr(_nn, "scaled_dot_product_attention")
-                logger.info("ℹ️ 已恢复默认 PyTorch SDPA (未启用 SageAttention)")
+            logger.info("ℹ️ 已恢复默认 PyTorch SDPA (未启用 SageAttention)")
 
         # Get model path
         model_path = folder_paths.get_full_path_or_raise("sam3", model)
