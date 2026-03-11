@@ -187,12 +187,26 @@ class PromptEncoder(nn.Module):
             box_embeddings = self._embed_boxes(boxes)
             sparse_embeddings = torch.cat([sparse_embeddings, box_embeddings], dim=1)
 
+        # 👇 ---------- 核心修改：动态适应分辨率 ---------- 👇
         if masks is not None:
             dense_embeddings = self._embed_masks(masks)
+            # 如果外界传进来的 image_embedding_size 是一个动态属性，我们需要以它为准
+            # 防止 _embed_masks 出来的尺寸依然是写死的旧尺寸
+            expected_h, expected_w = self.image_embedding_size
+            if dense_embeddings.shape[-2:] != (expected_h, expected_w):
+                import torch.nn.functional as F
+                dense_embeddings = F.interpolate(
+                    dense_embeddings, 
+                    size=(expected_h, expected_w), 
+                    mode="bilinear", 
+                    align_corners=False
+                )
         else:
+            # 没有掩码时，直接使用当前的 (可能已经被动态修改过的) image_embedding_size 来展开
             dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
                 bs, -1, self.image_embedding_size[0], self.image_embedding_size[1]
             )
+        # 👆 ---------- 核心修改结束 ---------- 👆
 
         return sparse_embeddings, dense_embeddings
 
