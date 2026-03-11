@@ -1210,8 +1210,14 @@ class Sam3VideoSegmentation(io.ComfyNode):
         video_predictor.model.masklet_confirmation_enable = False
         video_predictor.model.decrease_trk_keep_alive_for_empty_masklets = False
         
-        # --- 核心修改: 动态读取前端界面传来的分辨率参数 ---
-        video_predictor.model.image_size = int(image_size)
+       # --- 核心修改: 动态读取前端界面传来的分辨率参数 ---
+        new_size = int(image_size)
+        video_predictor.model.image_size = new_size
+        
+        # 👇 新增：必须同步更新底层的文本检测器(detector)分辨率
+        # 否则视频轨道跑768，文本轨道跑1008，会导致位置编码张量(RoPE)崩溃！
+        if hasattr(video_predictor.model, "detector"):
+            video_predictor.model.detector.image_size = new_size
 
         if extra_config is not None and isinstance(extra_config, dict):
             for key, value in extra_config.items():
